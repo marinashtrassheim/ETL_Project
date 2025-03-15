@@ -1,0 +1,133 @@
+name: ETL_Project
+
+x-postgresql-connection-env: &pg-connect
+  POSTGRESQL_APP_HOST: ${POSTGRESQL_APP_HOST}
+  POSTGRESQL_APP_DB: ${POSTGRESQL_APP_DB}
+  POSTGRESQL_APP_SCHEMA: ${POSTGRESQL_APP_SCHEMA}
+  POSTGRESQL_APP_USER: ${POSTGRESQL_APP_USER}
+  POSTGRESQL_APP_PASSWORD: ${POSTGRESQL_APP_PASSWORD}
+  POSTGRESQL_APP_PORT: ${POSTGRESQL_APP_PORT}
+
+x-airflow-common: &x-airflow-common
+  build: ./airflow
+  env_file:
+    - .env
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/airflow.cfg:/opt/airflow/airflow.cfg
+
+services:
+  postgres:
+    container_name: postgres
+    build: ./postgres
+    restart: always
+    env_file:
+      - .env
+    environment:
+      <<: *pg-connect
+      POSTGRES_PASSWORD: ${POSTGRES_ROOT_PASSWORD}
+    ports:
+      - "${POSTGRESQL_APP_PORT}:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRESQL_APP_USER}", "-d", "${POSTGRESQL_APP_DB}"]
+      interval: 5s
+      retries: 5
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  mongo:
+    build: ./mongo
+    container_name: mongo
+    restart: always
+    env_file:
+      - .env
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
+      MONGO_INITDB_DATABASE: ${MONGO_DB}
+      MONGO_DB: ${MONGO_DB}
+      MONGO_URI: mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@mongo:27017/
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  data_generator:
+    build: ./data_creator
+    container_name: mongo_data_generator
+    depends_on:
+      mongo:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
+      MONGO_DB: ${MONGO_DB}
+      MONGO_URI: mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@mongo:27017/
+    command: ["python", "mongo_generate_data.py"]
+
+  airflow-init:
+    build: ./airflow
+    container_name: airflow_init
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    env_file:
+      - .env
+    entrypoint:
+      - "/bin/bash"
+      - "-c"
+      - |
+          airflow db init &&
+          airflow db upgrade &&
+          airflow users create \
+            --username ${AIRFLOW_ADMIN_USERNAME} \
+            --firstname Admin \
+            --lastname User \
+            --role Admin \
+            --email ${AIRFLOW_ADMIN_EMAIL} \
+            --password ${AIRFLOW_ADMIN_PASSWORD} &&
+          airflow connections add 'etl_mongo' \
+            --conn-type 'mongo' \
+            --conn-host 'mongo' \
+            --conn-schema '${MONGO_DB}' \
+            --conn-login '${MONGO_INITDB_ROOT_USERNAME}' \
+            --conn-password '${MONGO_INITDB_ROOT_PASSWORD}' \
+            --conn-port 27017 \
+            --conn-extra '{"srv": false, "ssl": false, "allow_insecure": true, "authSource": "admin"}' &&
+          airflow connections add 'etl_postgres' \
+            --conn-type 'postgres' \
+            --conn-host 'postgres' \
+            --conn-schema '${POSTGRESQL_APP_DB}' \
+            --conn-login '${POSTGRESQL_APP_USER}' \
+            --conn-password '${POSTGRESQL_APP_PASSWORD}' \
+            --conn-port 5432
+
+  airflow-webserver:
+    <<: *x-airflow-common
+    container_name: airflow_webserver
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    entrypoint: ["airflow", "webserver"]
+
+  airflow-scheduler:
+    <<: *x-airflow-common
+    container_name: airflow_scheduler
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    entrypoint: ["airflow", "scheduler"]
+
+volumes:
+  pg_data:
+  mongo_data:
